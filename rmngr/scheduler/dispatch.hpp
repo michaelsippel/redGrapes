@@ -4,6 +4,9 @@
 #include <rmngr/thread_dispatcher.hpp>
 #include <rmngr/graph/util.hpp>
 
+#include <rmngr/scheduler/scheduler.hpp>
+#include <rmngr/observer_ptr.hpp>
+
 namespace rmngr
 {
 

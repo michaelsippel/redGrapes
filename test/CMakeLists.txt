@@ -107,7 +107,8 @@ set(TEST_SOURCES
     access.cpp
     resource.cpp
     resource_user.cpp
-    thread_dispatcher.cpp)
+    thread_dispatcher.cpp
+    stress_test.cpp)
 
 set(TEST_TARGET rmngr_test)
 
