@@ -156,10 +156,10 @@ public:
         cuda_graph_enabled( cuda_graph_enabled )
     {}
 
-    void activate_task( TaskPtr task_ptr )
+    bool activate_task( TaskPtr task_ptr )
     {
         auto task_id = task_ptr.get().task_id;
-
+        
         if(
             this->scheduling_graph->is_task_ready( task_id ) &&
             ! task_ptr.get().cuda_event
@@ -179,6 +179,10 @@ public:
             }
             else
                 dispatch_task( task_ptr, task_id );
+
+            return true;
+        } else {
+            return false;
         }
     }
 

@@ -26,6 +26,7 @@
 #include <iostream>
 
 #include <spdlog/spdlog.h>
+#include <optional>
 
 namespace redGrapes
 {
@@ -72,7 +73,7 @@ public:
      *
      * @return
      */
-    virtual VertexID push( T a ) = 0;
+    virtual void push( T && a ) = 0;
 
     /*! Update all outgoing edges of a vertex
      *
@@ -80,6 +81,8 @@ public:
      */
     virtual std::vector< VertexID > update_vertex( VertexID v ) = 0;
 
+    virtual std::optional< VertexID > advance() = 0;
+    
     /*! remove vertex
      */
     virtual void finish( VertexID v ) = 0;
@@ -158,7 +161,7 @@ class QueuedPrecedenceGraph
     
         /*! Add vertex to the graph according to the EnqueuePolicy
          */
-        VertexID push( T a )
+        void push( T && a )
         {
             if( auto graph = this->parent_graph.lock() )
             {
@@ -166,13 +169,26 @@ class QueuedPrecedenceGraph
                 EnqueuePolicy::assert_superset( graph_get( this->parent_vertex, graph->graph() ).first, a );
             }
 
-            VertexID v = boost::add_vertex( std::make_pair(a, std::shared_ptr<RecursiveGraph<T,Graph>>(nullptr)), this->graph() );
+            new_queue.push( std::move(a) );
+        }
+
+    //! take the next task from queue and calculate its dependencies
+    std::optional< VertexID > advance()
+    {
+        if( ! new_queue.empty() )
+        {
+            auto orig_task = std::move( new_queue.front() );
+            new_queue.pop();
+
+            VertexID v = boost::add_vertex( std::make_pair(std::move(orig_task), std::shared_ptr<RecursiveGraph<T,Graph>>(nullptr)), this->graph() );
+
+            auto & task = graph_get(v, this->graph()).first;
 
             bool end = true;
-            for(auto b : this->queue)
+            for(auto b : this->old_queue)
             {
                 T const & prop = graph_get(b.first, this->graph()).first;
-                if( EnqueuePolicy::is_serial(prop, a) )
+                if( EnqueuePolicy::is_serial(prop, task) )
                 {
                     boost::add_edge(b.first, v, this->graph());
                     if( b.second )
@@ -184,10 +200,13 @@ class QueuedPrecedenceGraph
                 }
             }
 
-            this->queue.insert(this->queue.begin(), std::make_pair(v, end));
+            this->old_queue.insert(this->old_queue.begin(), std::make_pair(v, end));
 
             return v;
         }
+        else
+            return std::nullopt;
+    }
 
         /*! Update all outgoing edges of a vertex
          * @return std::vector of all following vertices whose edge has been removed
@@ -205,9 +224,9 @@ class QueuedPrecedenceGraph
             boost::remove_vertex( vertex, this->graph() );
 
 
-            auto it = std::find_if(this->queue.begin(), this->queue.end(), [vertex](auto x){ return x.first == vertex; });
-            if (it != this->queue.end())
-                this->queue.erase(it);
+            auto it = std::find_if(this->old_queue.begin(), this->old_queue.end(), [vertex](auto x){ return x.first == vertex; });
+            if (it != this->old_queue.end())
+                this->old_queue.erase(it);
 
             else
             {
@@ -217,7 +236,9 @@ class QueuedPrecedenceGraph
         }
 
 private:
-    std::list<std::pair<VertexID, bool>> queue;
+    std::queue< T > new_queue;
+    std::list< std::pair<VertexID, bool> > old_queue;
+
 }; // class QueuedPrecedenceGraph
 
 } // namespace redGrapes           

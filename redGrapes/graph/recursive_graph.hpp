@@ -115,7 +115,7 @@ public:
             else
                 return *(sub->first);
         }
-
+        
         bool operator== ( Iterator const & other )
         {
             return g_it == other.g_it;

@@ -12,6 +12,9 @@
 
 int main()
 {
+    spdlog::set_pattern("[thread %t] %^[%l]%$ %v");
+    spdlog::set_level(spdlog::level::debug);
+
     redGrapes::Manager<> mgr;
 
     redGrapes::IOResource< int > a; // scope-level=0

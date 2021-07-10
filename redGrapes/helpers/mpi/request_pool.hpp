@@ -91,6 +91,8 @@ struct RequestPool
         auto status = std::make_shared< MPI_Status >();
         auto event_id = *mgr.create_event();
 
+        spdlog::info("mpi: event_id = {}", event_id);
+
         {
             std::lock_guard<std::mutex> lock( mutex );
             requests.push_back( request );

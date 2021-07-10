@@ -32,7 +32,9 @@ struct IScheduler
      */
     virtual void init_mgr_callbacks(
         std::shared_ptr< redGrapes::SchedulingGraph< TaskID, TaskPtr > > scheduling_graph,
+        std::function< bool () > advance,
         std::function< bool ( TaskPtr ) > run_task,
+        std::function< bool ( TaskPtr ) > activate,
         std::function< void ( TaskPtr ) > activate_followers,
         std::function< void ( TaskPtr ) > remove_task
     ) = 0;
@@ -47,7 +49,7 @@ struct IScheduler
 
     /*! Tell the scheduler to consider dispatching a task.
      */
-    virtual void activate_task( TaskPtr task_ptr ) = 0;
+    virtual bool activate_task( TaskPtr task_ptr ) = 0;
 
     /*! Notify the scheduler that the scheduling graph has changed.
      * The scheduler should now reconsider activated tasks which were not ready before
@@ -63,22 +65,30 @@ struct SchedulerBase : IScheduler< TaskID, TaskPtr >
 {
     void init_mgr_callbacks(
         std::shared_ptr< redGrapes::SchedulingGraph< TaskID, TaskPtr > > scheduling_graph,
+        std::function< bool () > advance,
         std::function< bool ( TaskPtr ) > run_task,
+        std::function< bool ( TaskPtr ) > activate,
         std::function< void ( TaskPtr ) > activate_followers,
         std::function< void ( TaskPtr ) > remove_task
     )
     {
         this->scheduling_graph = scheduling_graph;
-        this->run_task = run_task;
-        this->activate_followers = activate_followers;
-        this->remove_task = remove_task;
+        this->mgr_advance = advance;
+        this->mgr_run_task = run_task;
+        this->mgr_activate = activate;
+        this->mgr_activate_followers = activate_followers;
+        this->mgr_remove_task = remove_task;
     }
 
 protected:
+    // todo: move this to an interface-class
+
     std::shared_ptr< redGrapes::SchedulingGraph< TaskID, TaskPtr > > scheduling_graph;
-    std::function< bool ( TaskPtr ) > run_task;
-    std::function< void ( TaskPtr ) > activate_followers;
-    std::function< void ( TaskPtr ) > remove_task;
+    std::function< bool () > mgr_advance;
+    std::function< bool ( TaskPtr ) > mgr_run_task;
+    std::function< bool ( TaskPtr ) > mgr_activate;
+    std::function< void ( TaskPtr ) > mgr_activate_followers;
+    std::function< void ( TaskPtr ) > mgr_remove_task;
 };
 
 } // namespace scheduler

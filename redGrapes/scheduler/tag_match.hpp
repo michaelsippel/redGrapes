@@ -88,13 +88,15 @@ struct TagMatch : IScheduler< TaskID, TaskPtr >
 
     void init_mgr_callbacks(
         std::shared_ptr< redGrapes::SchedulingGraph< TaskID, TaskPtr > > scheduling_graph,
+        std::function< bool () > advance,
         std::function< bool ( TaskPtr ) > run_task,
+        std::function< bool ( TaskPtr ) > activate,
         std::function< void ( TaskPtr ) > activate_followers,
         std::function< void ( TaskPtr ) > remove_task
     )
     {
         for( auto & s : sub_schedulers )
-            s.s->init_mgr_callbacks( scheduling_graph, run_task, activate_followers, remove_task );
+            s.s->init_mgr_callbacks( scheduling_graph, advance, run_task, activate, activate_followers, remove_task );
     }
 
     void notify()
@@ -130,7 +132,7 @@ struct TagMatch : IScheduler< TaskID, TaskPtr >
             throw std::runtime_error("no scheduler found for task");
     }
 
-    void
+    bool
     activate_task( TaskPtr task_ptr )
     {
         if( auto sub_scheduler = get_matching_scheduler( task_ptr.get().required_scheduler_tags ) )

@@ -11,6 +11,7 @@
 #include <cassert>
 #include <redGrapes/graph/precedence_graph.hpp>
 #include <spdlog/spdlog.h>
+#include <optional>
 
 namespace redGrapes
 {
@@ -63,9 +64,18 @@ private:
         //! the set of subsequent events
         std::vector< EventID > followers;
 
+        //! task that will be activated when event is reached
+        std::optional< TaskPtr > task_ptr;
+
+        // marks whether the event is owned by a task,
+        // if yes then it will be removen when the task is removed,
+        // otherwise when reached in unsafe_notify_event
+        bool owned;
+        
         Event()
             // every event needs at least one down() before it will be removed
             : state( 1 )
+            , owned( false )
         {}
 
         bool is_reached() { return state == 0; }
@@ -78,6 +88,7 @@ private:
     {
         EventID pre_event;
         EventID post_event;
+        TaskPtr task_ptr;
     };
 
     std::mutex mutex;
@@ -90,7 +101,7 @@ private:
      *
      * Not thread safe!
      */
-    EventID make_event()
+    EventID make_event( bool owned = false )
     {
         EventID event_id = event_id_counter ++;
 
@@ -99,6 +110,8 @@ private:
             std::forward_as_tuple(event_id),
             std::forward_as_tuple()
         );
+
+        events[ event_id ].owned = owned;
 
         spdlog::trace("make event {}", event_id);
 
@@ -150,7 +163,9 @@ private:
                 unsafe_reach_event( follower );
 
             spdlog::trace("sg: remove event {}", id);
-            events.erase( id );
+
+            if( ! events[ id ].owned )
+                events.erase( id );
 
             return true;
         }
@@ -233,16 +248,26 @@ public:
         assert( task_events.count( task_id ) );
 
         EventID event_id = make_event();
+        events[ event_id ].task_ptr = task_events[ task_id ].task_ptr;
         add_edge( event_id, task_events[ task_id ].post_event );
 
         return event_id;
     }
 
     //! remove the initial dependency on this event
-    bool reach_event( EventID event_id )
+    //! @return task needs to be activated now
+    std::optional<TaskPtr> reach_event(EventID event_id)
     {
-        std::unique_lock< std::mutex > lock( mutex );
-        return unsafe_reach_event( event_id );
+        std::unique_lock<std::mutex> lock(mutex);
+
+        assert(events.count(event_id));
+
+        auto task_ptr = events[event_id].task_ptr;
+
+        if(unsafe_reach_event(event_id))
+            return task_ptr;
+        else
+            return std::nullopt;
     }
 
     //! checks whether the tasks pre-event is already ready
@@ -257,6 +282,12 @@ public:
             return events[ event_id ].is_ready();
         else
             return false;
+    }
+
+    bool exists_task( TaskID task_id )
+    {
+        std::lock_guard< std::mutex > lock( mutex );
+        return task_events.count( task_id );
     }
 
     //! checks whether the tasks post-event is already reached
@@ -298,7 +329,12 @@ public:
         std::lock_guard< std::mutex > lock( mutex );
         spdlog::trace("sg: pause task {}", task_id);
 
-        task_events[ task_id ].pre_event = make_event();
+        task_events[ task_id ].pre_event = make_event(true);
+
+        //events[ task_events[ task_id ].pre_event ].state = 1;
+
+        // this is whacky
+        events[ event_id ].task_ptr = task_events[ task_id ].task_ptr;
 
         if(
            events.count( event_id ) &&
@@ -314,6 +350,9 @@ public:
 
         std::lock_guard< std::mutex > lock( mutex );
         spdlog::trace("sg: remove task {}", task_id);
+
+        events.erase( task_events[task_id].pre_event );
+        events.erase( task_events[task_id].post_event );
         task_events.erase( task_id );
     }
 
@@ -333,8 +372,9 @@ public:
 
         // create new events for the task
         std::unique_lock< std::mutex > lock( mutex );
-        task_events[ task.task_id ].pre_event = make_event();
-        task_events[ task.task_id ].post_event = make_event();
+        task_events[ task.task_id ].task_ptr = task_ptr;
+        task_events[ task.task_id ].pre_event = make_event(true);
+        task_events[ task.task_id ].post_event = make_event(true);
 
         spdlog::trace(
             "sg: add task {}: pre={}, post={}",
@@ -356,7 +396,7 @@ public:
                 boost::source( *(it.first), task_ptr.graph->graph() )
             };
 
-            auto & preceding_task_id = preceding_task_ptr.get().task_id;
+            auto preceding_task_id = preceding_task_ptr.get().task_id;
             spdlog::trace("sg: preceding task {}", preceding_task_id);
 
             if(
@@ -391,6 +431,7 @@ public:
         {
             assert( task_events.count( *parent_id ) );
             assert( events.count( task_events[ *parent_id ].post_event ) );
+            spdlog::trace("sg: add edge to parent task");
             add_edge(
                 task_events[ task.task_id ].post_event,
                 task_events[ *parent_id ].post_event

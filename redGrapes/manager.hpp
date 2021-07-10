@@ -9,6 +9,7 @@
 
 #include <shared_mutex>
 #include <unordered_map>
+#include <queue>
 #include <boost/graph/adjacency_list.hpp>
 #include <boost/graph/graph_traits.hpp>
 
@@ -73,6 +74,15 @@ public:
             , vertex( other.vertex )
         {}
 
+        TaskPtr upgrade()
+        {
+            return TaskPtr
+                {
+                    graph.lock(),
+                    vertex
+                };
+        }
+
         Task & get() const
         {
             return graph_get(vertex, graph.lock()->graph()).first;
@@ -100,6 +110,17 @@ public:
         {
             auto lock = graph->shared_lock();
             return graph_get(vertex, graph->graph()).first;
+        }
+
+        std::shared_ptr< PGraph > get_subgraph() const
+        {
+            auto lock = graph->shared_lock();
+            return std::dynamic_pointer_cast< PGraph >( graph_get(vertex, graph->graph()).second );
+        }
+
+        bool operator==(TaskPtr const & other)
+        {
+            return this->graph == other.graph && this->vertex == other.vertex;
         }
 
         // TODO: move to PrecedenceGraph
@@ -199,6 +220,7 @@ public:
 
     ~Manager( )
     {
+        spdlog::info("~Manager()");
         while( ! scheduling_graph->empty() )
             redGrapes::thread::idle();
 
@@ -218,10 +240,35 @@ public:
         this->scheduler = scheduler;
         this->scheduler->init_mgr_callbacks(
             scheduling_graph,
-            [this] ( TaskPtr task_ptr ) { return run_task( task_ptr ); },
-            [this] ( TaskPtr task_ptr ) { activate_followers( task_ptr ); },
-            [this] ( TaskPtr task_ptr ) { remove_task( task_ptr ); }
-        );
+            [this]()
+            {
+                auto lock = this->main_graph->unique_lock();
+
+                while(auto v = this->main_graph->advance())
+                {
+                    lock.unlock();
+                    {
+                    auto l = this->main_graph->shared_lock();
+                    if(this->scheduler->activate_task(TaskPtr{this->main_graph, *v}))
+                    {
+                        this->scheduler->notify();
+                        return true;
+                    }
+                    }
+                    lock.lock();
+                }
+
+                return false;
+            },
+            [this](TaskPtr task_ptr) {
+                return run_task(task_ptr);
+            },
+            [this](TaskPtr task_ptr) {
+                auto l = task_ptr.graph->shared_lock();
+                return this->scheduler->activate_task(task_ptr);
+            },
+            [this](TaskPtr task_ptr) { activate_followers(task_ptr); },
+            [this](TaskPtr task_ptr) { remove_task(task_ptr); });
     }
 
     /*! create a new task, as child of the currently running task (if there is one)
@@ -300,21 +347,6 @@ public:
             builder
         );
 
-        spdlog::debug( "emplace_task {}\n", (TaskProps const&)task );
-
-        this->push_task( std::move( task ) );
-
-        return make_working_future( std::move(future), *this, result_event );
-    }
-
-    /*! Enqueue a task object into the precedence graph of
-     *  the currently running parent task (or the root graph
-     *  if there is no parent).
-     *
-     * @return Wrapper object for accessing task information
-     */
-    TaskPtr push_task( Task && task )
-    {
         if( auto parent = current_task() )
         {
             task.parent = WeakTaskPtr(*parent);
@@ -323,23 +355,32 @@ public:
         else
             task.impl->scope_level = 1;
 
-        auto g = get_current_graph();
-        auto g_lock = g->unique_lock();
+        spdlog::debug( "emplace_task {}\n", (TaskProps const&)task );
 
-        auto vertex = g->push( task );
-        TaskPtr task_ptr { g, vertex };
-        scheduling_graph->add_task( task_ptr );
-
-        g_lock.unlock();
         {
-            auto g_lock = g->shared_lock();
-            scheduler->activate_task( task_ptr );
+            auto graph = get_current_graph();
+            auto graph_lock = graph->unique_lock();
+            get_current_graph()->push( std::move( task ) );
         }
 
+        // wakeup sleeping worker thread
         scheduler->notify();
 
-        return task_ptr;
+        return make_working_future( std::move(future), *this, result_event );
     }
+
+    /*! Check all precedence graphs recursively
+     *  until a task is found whose dependencies were
+     *  not yet calculated and insert it into the precedence graph.
+     *  If a task is found, the search is aborted and the task returned
+     *  nullopt as result means no more tasks are available, need to wait
+     */
+    /*
+    std::optional< TaskPtr > advance()
+    {
+        return this->main_graph->advance();
+    }
+    */
 
     /*! Start the execution of a task.
      *
@@ -347,7 +388,7 @@ public:
      */
     bool run_task( TaskPtr task_ptr )
     {
-        auto tl = task_ptr.graph->unique_lock(); // use shared_lock ??
+        auto tl = task_ptr.graph->shared_lock(); // use shared_lock ??
         auto impl = task_ptr.get().impl;
         auto task_id = task_ptr.get().task_id;
 
@@ -415,7 +456,13 @@ public:
     //! flag the state of the event & update
     void reach_event( EventID event_id )
     {
-        scheduling_graph->reach_event( event_id );
+        //spdlog::trace("mgr: reach event {}", event_id);
+        if( auto task_ptr = scheduling_graph->reach_event( event_id ) )
+        {
+            auto graph_lock = task_ptr->graph->shared_lock();
+            scheduler->activate_task( *task_ptr );
+        }
+
         scheduler->notify();
     }
 
@@ -434,32 +481,43 @@ public:
             return std::nullopt;
     }
 
+    std::shared_ptr< PGraph >
+    get_sub_graph( TaskPtr task_ptr )
+    {
+        auto parent_graph = task_ptr.graph;
+        auto l = parent_graph->shared_lock();
+        auto g = graph_get( task_ptr.vertex, parent_graph->graph() ).second;
+        l.unlock();
+
+        if( !g )
+        {
+            auto new_graph = std::shared_ptr< PGraph >( parent_graph->default_child( parent_graph, task_ptr.vertex ) );
+            parent_graph->add_subgraph( task_ptr.vertex, new_graph );
+            return new_graph;
+        }
+        else
+            return std::dynamic_pointer_cast< PGraph >( g );
+    }
+
+    std::shared_ptr< PGraph >
+    get_parent_graph( Task const & task )
+    {
+        if( auto parent_task_ptr = task.parent )
+            return get_sub_graph( parent_task_ptr->upgrade() );
+        else
+            return this->main_graph;
+    }
+
     //! get the subgraph which contains all children of the currently running task
     std::shared_ptr< PGraph >
     get_current_graph( void )
     {
         if( auto task_ptr = current_task() )
-        {
-            auto parent_graph = task_ptr->graph;
-            auto l = parent_graph->shared_lock();
-            auto g = graph_get( task_ptr->vertex, parent_graph->graph() ).second;
-            l.unlock();
-
-            if( !g )
-            {
-                auto new_graph = std::shared_ptr< PGraph >( parent_graph->default_child( parent_graph, task_ptr->vertex ) );
-                parent_graph->add_subgraph( task_ptr->vertex, new_graph );
-                return new_graph;
-            }
-            else
-                return std::dynamic_pointer_cast< PGraph >( g );
-        }
+            return get_sub_graph( *task_ptr );
         else
-        {
             /* the current thread is not executing a task,
                so we use the root-graph as default */
             return this->main_graph;
-        }
     }
 
     //! apply a patch to the properties of the currently running task
@@ -505,6 +563,7 @@ public:
     //! pause the currently running task at least until event_id is reached
     void yield( EventID event_id )
     {
+        spdlog::trace("yield for event {}", event_id);
         while( ! scheduling_graph->is_event_reached( event_id ) )
         {
             if( current_task() )

@@ -25,25 +25,20 @@ template <
 >
 struct FIFO : public SchedulerBase< TaskID, TaskPtr >
 {
-    enum TaskState
-    {
-        uninitialized = 0,
-        pending,
-        ready,
-        running,
-        paused,
-        done
-    };
-
 private:
-    std::mutex mutex;
-    std::unordered_map< TaskID, TaskState > states;
 
-    //! contains activated, not yet removed tasks (ready, paused, running)
-    std::vector< std::pair< TaskID, TaskPtr > > active_tasks;
+    // active = ready, running, paused, done (but not finished)
+    std::mutex mutex_active_tasks;
+    std::unordered_set< TaskID > active_tasks;
 
-    //! contains ready tasks that are queued for execution
-    std::queue< TaskPtr > task_queue;
+    std::mutex mutex_running_tasks;
+    std::list< TaskPtr > running_tasks; // running or paused
+
+    std::mutex mutex_ready_tasks;
+    std::queue< TaskPtr > ready_tasks;
+
+    std::mutex mutex_done_tasks;
+    std::vector< std::pair< TaskID, TaskPtr > > done_tasks;
 
 public:
     //! returns true if a job was consumed, false if queue is empty
@@ -55,21 +50,32 @@ public:
             this->scheduling_graph->task_start( task_id );
 
             {
-                std::unique_lock< std::mutex > l( mutex );
-                states[ task_id ] = running;
+                std::unique_lock< std::mutex > l( mutex_running_tasks );
+                running_tasks.push_back( *task_ptr );
             }
 
-            bool finished = this->run_task( *task_ptr );
+            bool finished = this->mgr_run_task( *task_ptr );
 
             if( finished )
             {
+                spdlog::trace("task {} finished", task_id);
                 this->scheduling_graph->task_end( task_id );
-                //this->activate_followers( *task_ptr );
             }
 
             {
-                std::unique_lock< std::mutex > l( mutex );
-                states[ task_id ] = finished ? done : paused;
+                std::unique_lock< std::mutex > l_active( mutex_active_tasks );
+                active_tasks.erase( task_id );
+            }
+
+            if( finished )
+            {
+                {
+                    std::unique_lock< std::mutex > l_d( mutex_done_tasks );
+                    std::unique_lock< std::mutex > l_r( mutex_running_tasks );
+
+                    done_tasks.push_back( std::make_pair(task_id, *task_ptr) );
+                    running_tasks.remove( *task_ptr );
+                }
             }
 
             return true;
@@ -78,93 +84,147 @@ public:
             return false;
     }
 
-    // precedence graph must be locked
-    void activate_task( TaskPtr task_ptr )
+    //! checks for a pending or paused task if it is ready
+    //! precedence graph must be locked
+    bool activate_task( TaskPtr task_ptr )
     {
-        std::unique_lock< std::mutex > l( mutex );
+        std::unique_lock< std::mutex > l_active( mutex_active_tasks );
+
         auto task_id = task_ptr.get().task_id;
+        spdlog::trace("activate task {}", task_id);
 
-        if( ! this->scheduling_graph->is_task_finished( task_id ) )
+        if( ! active_tasks.count(task_id) )
         {
-            if( ! states.count( task_id ) ) // || states[ task_id ] = uninitialized
-            {
-                states[ task_id ] = pending;
-                active_tasks.push_back( std::make_pair( task_id, task_ptr ) );
-            }
+            if( ! this->scheduling_graph->exists_task( task_id ) )
+                this->scheduling_graph->add_task( task_ptr );
 
-            switch( states[ task_id ] )
+            if( ! this->scheduling_graph->is_task_finished( task_id ) )
             {
-            case TaskState::paused:
-            case TaskState::pending:
                 if( this->scheduling_graph->is_task_ready( task_id ) )
                 {
-                    states[ task_id ] = ready;
-                    task_queue.push( task_ptr );
-                }
+                    active_tasks.insert( task_id );
 
-            default: break;
+                    std::unique_lock< std::mutex > l_ready( mutex_ready_tasks );
+                    ready_tasks.push( task_ptr );
+
+                    return true;
+                }
             }
         }
+
+        return false;
     }
 
 private:
+    //! get a task from the ready queue if available
     std::optional< TaskPtr > get_job()
     {
-        std::unique_lock< std::mutex > l( mutex );
+        std::unique_lock< std::mutex > l_ready( mutex_ready_tasks );
 
-        if( task_queue.empty() )
-            update( l );
-
-        if( ! task_queue.empty() )
+        if( ready_tasks.empty() )
         {
-            auto task_ptr = task_queue.front();
-            task_queue.pop();
+            // try to advance the calculation
+            // until we have something in the ready queue
+            l_ready.unlock();
+            update();
+            l_ready.lock();
 
-            return task_ptr;
+            // if the queue is still empty, the worker has to wait
+            if( ready_tasks.empty() )
+                return std::nullopt;
         }
-        else
-            return std::nullopt;
+
+        // we have a ready task
+        auto task_ptr = std::move( ready_tasks.front() );
+        ready_tasks.pop();
+
+        return task_ptr;
     }
 
-    //! update all active tasks
-    void update( std::unique_lock< std::mutex > & l )
+    //! try to get at least one task into the ready queue
+    void update()
     {
-        for( size_t i = 0; i < active_tasks.size(); ++i )
         {
-            auto task_id = active_tasks[ i ].first;
-            auto task_ptr = active_tasks[ i ].second;
+            // remove done tasks
 
-            switch( states[ task_id ] )
+            std::unique_lock< std::mutex > l_done( mutex_done_tasks );
+            for( size_t i = 0; i < done_tasks.size(); ++i )
             {
-            case TaskState::done:
-                /* if there are there events which must precede the tasks post-event
-                 * we can not remove the task yet.
-                 */
+                auto task_id = done_tasks[i].first;
+                auto task_ptr = done_tasks[i].second;
+
+                if( auto graph = task_ptr.get_subgraph() )
+                {
+                    auto grlock = graph->unique_lock();
+                    while( auto new_task_vertex = graph->advance() )
+                    {
+                        grlock.unlock();
+                        if( this->mgr_activate(TaskPtr{ graph, *new_task_vertex }) )
+                        {
+                            /*
+                            std::unique_lock< std::mutex > l_ready( mutex_ready_tasks );
+                            if( ! ready_tasks.empty() )
+                                return;
+                            */
+                        }
+                        grlock.lock();
+                    }
+                }
+
                 if( this->scheduling_graph->is_task_finished( task_id ) )
                 {
-                    spdlog::trace("fifo::update(): task {} finished", task_id);
-                    active_tasks.erase( active_tasks.begin() + i );
+                    spdlog::trace("erase done task {}", task_id);
+                    done_tasks.erase( done_tasks.begin() + i );
+
                     -- i;
 
-                    l.unlock();
-                    this->activate_followers( task_ptr );
-                    this->remove_task( task_ptr );
-                    l.lock();
+                    this->mgr_activate_followers( task_ptr ); // will take mutex_active_tasks and mutex_ready_tasks
+                    this->mgr_remove_task( task_ptr );
                 }
-                break;
-
-            case TaskState::paused:
-            case TaskState::pending:
-                if( this->scheduling_graph->is_task_ready( task_id ) )
-                {
-                    states[ task_id ] = ready;
-                    task_queue.push( task_ptr );
-                }
-                break;
-
-            default: break;
             }
         }
+        /*
+        {
+            std::unique_lock< std::mutex > l_ready( mutex_ready_tasks );
+            if( ! ready_tasks.empty() )
+                return;
+        }
+        */
+        // advance subgraphs until a ready task appears
+        {
+            std::unique_lock< std::mutex > l_running( mutex_running_tasks );
+            for( auto task_ptr : running_tasks )
+            {
+                //spdlog::info("check running task {}", task_ptr.locked_get().task_id);
+                auto graph = task_ptr.get_subgraph();
+                if( graph )
+                {
+                    auto grlock = graph->unique_lock();
+                    while( auto new_task_vertex = graph->advance() )
+                    {
+                        grlock.unlock();
+                        TaskPtr new_task_ptr{ graph, *new_task_vertex };
+                        if( this->mgr_activate( new_task_ptr ) )
+                        {
+                            /*
+                            std::unique_lock< std::mutex > l_ready( mutex_ready_tasks );
+                            if( ! ready_tasks.empty() )
+                                return;
+                            */
+                        }
+                        grlock.lock();
+                    }
+                }
+            }
+        }
+
+        if( this->mgr_advance )
+            while( this->mgr_advance() )
+            {
+                std::unique_lock< std::mutex > l_ready( mutex_ready_tasks );
+                if( ! ready_tasks.empty() )
+                    return;
+            }
     }
 };
 

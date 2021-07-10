@@ -172,19 +172,22 @@ public:
         spdlog::info( "CuplaScheduler: use {} streams", streams.size() );
     }
 
-    void activate_task( TaskPtr task_ptr )
+    bool activate_task( TaskPtr task_ptr )
     {
         auto task_id = task_ptr.get().task_id;
 
         spdlog::trace("CuplaScheduler: activate task {} \"{}\"", task_id, task_ptr.get().label);
 
-        std::unique_lock< std::mutex > lock( mutex );
-        
+        if( ! this->scheduling_graph->exists_task( task_id ) )
+            this->scheduling_graph->add_task( task_ptr );
+
         if(
             this->scheduling_graph->is_task_ready( task_id ) &&
             ! task_ptr.get().cupla_event
         )
         {
+            std::unique_lock< std::mutex > lock( mutex );
+
             if( cupla_graph_enabled && ! recording )
             {
                 recording = true;
@@ -199,6 +202,10 @@ public:
             }
             else
                 dispatch_task( lock, task_ptr, task_id );
+
+            return true;
+        } else {
+            return false;
         }
     }
 
@@ -247,7 +254,7 @@ public:
             *task_ptr.get().cupla_event
         );
 
-        this->activate_followers( task_ptr );
+        this->mgr_activate_followers( task_ptr );
     }
 
     //! checks if some cupla calls finished and notify the redGrapes manager
@@ -261,8 +268,8 @@ public:
                 spdlog::trace( "cupla task {} done", task_id );
 
                 this->scheduling_graph->task_end( task_id );
-                this->activate_followers( *task_ptr );
-                this->remove_task( *task_ptr );
+                this->mgr_activate_followers( *task_ptr );
+                this->mgr_remove_task( *task_ptr );
             }
         }
     }
